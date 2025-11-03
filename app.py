@@ -12,7 +12,6 @@ from dotenv import load_dotenv
 from SmartApi.smartConnect import SmartConnect
 import pyotp
 from typing import Optional
-import io, zipfile  # NEW: for robust mobile file reading
 
 # ================== App setup ==================
 st.set_page_config(page_title="Chartink Visualizer • Axis Zoom + Limited Window", layout="wide")
@@ -196,80 +195,26 @@ def ema_no_partial(series: pd.Series, length: int) -> pd.Series:
         ema.iloc[:L-1] = np.nan
     return ema
 
-# ================== Mobile-friendly reader (Android/iOS) ==================
-def read_uploaded_df(uploaded_file) -> pd.DataFrame:
-    """
-    Robustly read CSV/TXT/XLSX/XLS or a ZIP (with CSV) from desktop or mobile pickers.
-    Works around Android MIME quirks by sniffing both extension and MIME.
-    """
-    raw = uploaded_file.read()
-    name = (uploaded_file.name or "").lower()
-    mime = (uploaded_file.type or "").lower()
-
-    def try_csv(buf: bytes) -> pd.DataFrame:
-        bio = io.BytesIO(buf)
-        return pd.read_csv(bio, engine="python", encoding="utf-8", on_bad_lines="skip")
-
-    def try_excel(buf: bytes) -> pd.DataFrame:
-        bio = io.BytesIO(buf)
-        return pd.read_excel(bio)  # requires openpyxl for .xlsx
-
-    # Extension-based
-    if name.endswith((".csv", ".txt", ".csv.gz")):
-        return try_csv(raw)
-    if name.endswith((".xlsx", ".xls")):
-        return try_excel(raw)
-    if name.endswith(".zip"):
-        zf = zipfile.ZipFile(io.BytesIO(raw))
-        csv_members = [m for m in zf.namelist() if m.lower().endswith(".csv")]
-        if not csv_members:
-            raise ValueError("Zip does not contain a CSV file.")
-        with zf.open(csv_members[0]) as f:
-            return pd.read_csv(f, engine="python", encoding="utf-8", on_bad_lines="skip")
-
-    # MIME-based (mobile often uses vendor-specific types)
-    if mime in {"text/csv", "application/csv", "text/plain"}:
-        return try_csv(raw)
-    if mime in {"application/vnd.ms-excel", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"}:
-        return try_excel(raw)
-    if mime == "application/zip":
-        zf = zipfile.ZipFile(io.BytesIO(raw))
-        csv_members = [m for m in zf.namelist() if m.lower().endswith(".csv")]
-        if not csv_members:
-            raise ValueError("Zip does not contain a CSV file.")
-        with zf.open(csv_members[0]) as f:
-            return pd.read_csv(f, engine="python", encoding="utf-8", on_bad_lines="skip")
-
-    # Last resort: try CSV then Excel
-    try:
-        return try_csv(raw)
-    except Exception:
-        pass
-    try:
-        return try_excel(raw)
-    except Exception:
-        pass
-
-    raise ValueError("Unsupported or unreadable file. Please upload CSV/TXT/XLSX/XLS, or a ZIP containing a CSV.")
-
 # ================== Sidebar ==================
+# Optional query param auto-enable (?mobile=1)
+try:
+    _qp = st.query_params  # streamlit>=1.32
+except Exception:
+    try:
+        _qp = st.experimental_get_query_params()
+    except Exception:
+        _qp = {}
+_mobile_default = False
+try:
+    _mv = _qp.get("mobile", ["0"])
+    _mv = _mv[0] if isinstance(_mv, list) else _mv
+    _mobile_default = str(_mv).lower() in ("1", "true", "yes", "y", "on")
+except Exception:
+    _mobile_default = False
+
 with st.sidebar:
     st.header("Input")
-
-    # NEW: Mobile-friendly toggle + flexible file types
-    mobile_friendly = st.toggle(
-        "Mobile-friendly file picker (Android/iOS)",
-        value=True,
-        help="If files look greyed out on Android, enable this to select any file. The app will auto-detect CSV/XLSX/ZIP."
-    )
-    accepted_types = None if mobile_friendly else ["csv"]  # None = allow all; better for mobile pickers
-
-    uploaded = st.file_uploader(
-        "Upload screener file",
-        type=accepted_types,
-        accept_multiple_files=False
-    )
-
+    uploaded = st.file_uploader("Upload Chartink CSV", type=["csv"])
     tf = st.selectbox("Timeframe", TF_CHOICES, index=TF_CHOICES.index("15m"))
 
     st.subheader("CSV column mapping")
@@ -295,21 +240,32 @@ with st.sidebar:
     initial_charts = st.number_input("Initial charts to load", min_value=1, max_value=100, value=12, step=1)
     charts_per_click = st.number_input("Charts per click (Load more)", min_value=1, max_value=100, value=10, step=1)
 
+    st.subheader("Mobile")
+    mobile_mode = st.toggle(
+        "Mobile mode (touch-friendly)",
+        value=_mobile_default,
+        help="Disables touch scroll/pinch zoom and limits candles for readability. Does not affect desktop."
+    )
+    mobile_max_candles = st.slider(
+        "Max candles on mobile",
+        20, 120, 60, 5,
+        disabled=not mobile_mode,
+        help="Upper limit on candles rendered on phones (applies in both auto-fit and manual modes)."
+    )
+    lock_scale_mobile = st.toggle(
+        "Lock chart scale on mobile (no zoom/pan)",
+        value=True,
+        disabled=not mobile_mode,
+        help="Prevents any zooming/panning on phones to avoid accidental gestures."
+    )
+
     st.caption("Axis-drag zoom: drag on the X-axis to zoom horizontally; drag on the Y-axis to zoom vertically. Double-click to reset.")
 
 # ================== Main ==================
 token_map = load_token_map()
 
 if uploaded:
-    # Use robust reader (works on Android/iOS/desktop). Make a fresh buffer per read:
-    try:
-        # Important: we already consumed the file bytes in read_uploaded_df.
-        # For later references (like uploaded.name) we can still read .name, but not the stream.
-        src_df = read_uploaded_df(uploaded)
-    except Exception as e:
-        st.error(f"Could not read the uploaded file: {e}")
-        st.stop()
-
+    src_df = pd.read_csv(uploaded)
     # Validate mapping
     for c in [date_col, symbol_col]:
         if c not in src_df.columns:
@@ -331,10 +287,8 @@ if uploaded:
     except Exception:
         st.stop()
 
-    # Pagination state reset when input scope changes
-    # Note: uploaded.name is safe to read even if file bytes are consumed
-    uploaded_name = getattr(uploaded, "name", "upload")
-    scope_key = f"{uploaded_name}|{len(df_screen)}|{tf}|{gapless}|{auto_fit}|{target_px_per_candle}|{approx_chart_width_px}|{n_before}|{n_after}"
+    # Pagination state reset when input scope changes (include mobile knobs so list resets cleanly if you change them)
+    scope_key = f"{uploaded.name}|{len(df_screen)}|{tf}|{gapless}|{auto_fit}|{target_px_per_candle}|{approx_chart_width_px}|{n_before}|{n_after}|{mobile_mode}|{mobile_max_candles}|{lock_scale_mobile}"
     if st.session_state.get("scope_key") != scope_key:
         st.session_state.scope_key = scope_key
         st.session_state.display_limit = int(initial_charts)
@@ -363,11 +317,19 @@ if uploaded:
         # Determine window size
         if auto_fit:
             desired = max(10, int(approx_chart_width_px // max(6, target_px_per_candle)))
+            if mobile_mode:
+                desired = min(desired, int(mobile_max_candles))  # cap for phones
             n_before_eff = desired // 2
             n_after_eff = desired - n_before_eff
         else:
             n_before_eff = int(n_before)
             n_after_eff = int(n_after)
+            if mobile_mode:
+                # Ensure total candles <= mobile_max_candles while preserving "before" emphasis
+                total_desired = n_before_eff + n_after_eff
+                if total_desired > mobile_max_candles:
+                    n_before_eff = min(n_before_eff, mobile_max_candles // 2)
+                    n_after_eff = mobile_max_candles - n_before_eff
 
         # Fetch minimal data around signal (enough for indicators + view)
         signal_dt_ist = IST.localize(signal_dt_naive)
@@ -557,8 +519,10 @@ if uploaded:
                 fig.update_xaxes(showgrid=False, tickformat="%d-%b %H:%M" if intraday else "%d-%b %Y",
                                  ticks="outside", tickangle=-35, rangeslider=dict(visible=False),
                                  rangebreaks=range_breaks, row=r, col=1)
-                fig.update_yaxes(showgrid=True, gridcolor="rgba(230,230,230,0.45)", zeroline=False,
-                                 ticks="outside", row=r, col=1)
+            fig.update_yaxes(showgrid=True, gridcolor="rgba(230,230,230,0.45)", zeroline=False,
+                             ticks="outside", row=1, col=1)
+            fig.update_yaxes(showgrid=True, gridcolor="rgba(230,230,230,0.45)", zeroline=False,
+                             ticks="outside", row=2, col=1)
 
             if len(ts) > 1:
                 cw_sec = (ts[1] - ts[0]).total_seconds()
@@ -569,33 +533,44 @@ if uploaded:
             fig.add_vrect(x0=center_dt - timedelta(seconds=half), x1=center_dt + timedelta(seconds=half),
                           fillcolor="yellow", opacity=0.14, layer="below", line_width=0, row="all", col=1)
 
-        # Layout: axis-drag zoom only (disable wheel & panning)
+        # Layout and interactivity
+        # Desktop/web keeps original behavior. Mobile mode tweaks touch behavior only.
         fig.update_layout(
             height=int(chart_h),
             margin=dict(l=40, r=20, t=30, b=30),
             template="simple_white",
             hovermode="x unified",
-            dragmode="zoom",
+            dragmode=("pan" if mobile_mode else "zoom"),
             showlegend=True,
             bargap=0.06,
-            uirevision=f"{uploaded_name}|{tf}|{gapless}|{auto_fit}|{target_px_per_candle}|{approx_chart_width_px}|{n_before}|{n_after}",
+            uirevision=f"{uploaded.name}|{tf}|{gapless}|{auto_fit}|{target_px_per_candle}|{approx_chart_width_px}|{n_before}|{n_after}|{mobile_mode}|{mobile_max_candles}|{lock_scale_mobile}",
         )
-        fig.update_xaxes(fixedrange=False)
-        fig.update_yaxes(fixedrange=False)
 
+        # Axis ranges: on mobile, optionally fully lock to avoid accidental pinch/scroll zoom
+        if mobile_mode and lock_scale_mobile:
+            fig.update_xaxes(fixedrange=True)
+            fig.update_yaxes(fixedrange=True)
+        else:
+            fig.update_xaxes(fixedrange=False)
+            fig.update_yaxes(fixedrange=False)
+
+        # Plotly config
         config = dict(
             displayModeBar=True,
             displaylogo=False,
-            scrollZoom=False,  # force zoom via axis-drag (wheel disabled)
+            scrollZoom=False,  # keep wheel/trackpad zoom disabled
             modeBarButtonsToRemove=[
                 "toImage","lasso2d","select2d","toggleSpikelines",
-                "hoverClosestCartesian","hoverCompareCartesian","pan2d","autoScale2d"
+                "hoverClosestCartesian","hoverCompareCartesian","autoScale2d"
             ],
         )
+        if mobile_mode:
+            # Hide zoom buttons to avoid accidental zoom on phones
+            config["modeBarButtonsToRemove"] += ["zoom2d","zoomIn2d","zoomOut2d","resetScale2d"]
 
         sig_title_dt = candle_start if candle_start in df_view.index else df_view.index[0]
         st.subheader(f"{symbol_eq} • TF: {tf} • {sig_title_dt.strftime('%d %b %Y %I:%M %p').lower()} IST")
-        st.caption("Drag on the X-axis to zoom horizontally; drag on the Y-axis to zoom vertically. Double-click to reset.")
+        st.caption("On desktop: drag X/Y axes to zoom. On mobile (Mobile mode): zoom is disabled to prevent accidental gestures.")
         st.plotly_chart(fig, use_container_width=True, config=config, key=f"chart_{symbol_eq}_{tf}_{idx}")
 
         charts_rendered += 1
@@ -620,4 +595,4 @@ if uploaded:
                 st.session_state.display_limit = total_rows
                 st.rerun()
 else:
-    st.info("Awaiting screener file…")
+    st.info("Awaiting CSV upload…")
